@@ -1,39 +1,52 @@
-name: GitHub Workflow Report
+name: GitHub Activity Report
 
 on:
   push:
     branches:
       - main
-  workflow_dispatch:
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:   # allow manual runs from the Actions UI
 
 jobs:
-  generate_report:
+  report:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read   # needed to read repo data via GH_PAT
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install dependencies
         run: |
-          pip install pandas requests openpyxl
+          pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run GitHub Activity Report
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          python github_activity_report.py
+          GH_PAT:  ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+        run: python github_activity_report.py
 
-      - name: Upload Excel report
+      - name: Upload Excel report as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: github_full_activity_report
-          path: github_full_activity_report.xlsx
+          name: github_activity_report
+          path: github_activity_report.xlsx
+          if-no-files-found: error
