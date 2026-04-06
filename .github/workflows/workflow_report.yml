@@ -1,24 +1,12 @@
 name: GitHub Workflow Report
 
 on:
-  # Manual trigger
-  workflow_dispatch:  # Uncomment to enable manual trigger
-
   # Trigger on push to main branch
   push:
-     branches:
-       - main
+    branches:
+      - main
 
-  # Trigger on pull request targeting main branch
-  # pull_request:
-  #   branches:
-  #     - main
-
-  # Custom schedule (daily at 09:00 UTC)
-  # schedule:
-  #   - cron: '0 9 * * *'  # Every day at 09:00 UTC
-
-  jobs:
+jobs:
   report:
     runs-on: ubuntu-latest
 
