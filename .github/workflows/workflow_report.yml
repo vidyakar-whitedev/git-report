@@ -1,0 +1,48 @@
+name: GitHub Workflow Report
+
+on:
+  # Manual trigger
+  workflow_dispatch:  # Uncomment to enable manual trigger
+
+  # Trigger on push to main branch
+  push:
+     branches:
+       - main
+
+  # Trigger on pull request targeting main branch
+  # pull_request:
+  #   branches:
+  #     - main
+
+  # Custom schedule (daily at 09:00 UTC)
+  # schedule:
+  #   - cron: '0 9 * * *'  # Every day at 09:00 UTC
+
+  jobs:
+  report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests pandas openpyxl
+
+      - name: Run GitHub Workflow Report
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          python github_workflow_report.py
+
+      - name: Upload Excel report
+        uses: actions/upload-artifact@v3
+        with:
+          name: github_workflow_report
+          path: github_workflow_report.xlsx
