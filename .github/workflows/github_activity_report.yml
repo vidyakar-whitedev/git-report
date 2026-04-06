@@ -4,8 +4,10 @@ on:
   push:
     branches:
       - main
-#   workflow_dispatch:
-# name: GitHub Full Activity Report
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   generate_report:
@@ -13,10 +15,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -31,7 +33,7 @@ jobs:
           python github_activity_report.py
 
       - name: Upload Excel report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: github_full_activity_report
           path: github_full_activity_report.xlsx
