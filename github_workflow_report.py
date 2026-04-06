@@ -8,7 +8,7 @@ import time
 
 # ---------------- CONFIGURATION ----------------
 token = os.getenv("GH_PAT")
-organization = "your_org_name"  # Replace with your GitHub org name
+organization = os.getenv("GH_ORG")  # Set GH_ORG secret in your repo settings
 per_page = 100
 # -----------------------------------------------
 
