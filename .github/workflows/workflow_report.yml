@@ -30,7 +30,7 @@ jobs:
           python github_workflow_report.py
 
       - name: Upload Excel report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: github_workflow_report
           path: github_workflow_report.xlsx
