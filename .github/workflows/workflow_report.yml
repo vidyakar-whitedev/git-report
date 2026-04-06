@@ -1,10 +1,13 @@
 name: GitHub Workflow Report
 
 on:
-  # Trigger on push to main branch
   push:
     branches:
       - main
+
+env:
+  # Force Node.js 24 for all JS actions to avoid future deprecation issues
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   report:
@@ -19,9 +22,18 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install dependencies
         run: |
-          pip install requests pandas openpyxl
+          pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run GitHub Workflow Report
         env:
