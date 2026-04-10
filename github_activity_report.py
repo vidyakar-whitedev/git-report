@@ -55,7 +55,7 @@ GH_PAT        = os.getenv("GH_PAT") or os.getenv("GITHUB_TOKEN", "")
 GH_REPO       = os.getenv("GH_REPO") or os.getenv("GITHUB_REPOSITORY", "")
 OUTPUT        = os.getenv("GH_OUTPUT", "github_activity_report.xlsx")
 MAX_RUNS      = int(os.getenv("GH_MAX_RUNS", "200"))
-LOOKBACK_DAYS = int(os.getenv("GH_LOOKBACK_DAYS", "30"))
+LOOKBACK_DAYS = int(os.getenv("GH_LOOKBACK_DAYS", "2"))
 GH_SINCE      = os.getenv("GH_SINCE", "")   # e.g. "2024-01-01"
 GH_UNTIL      = os.getenv("GH_UNTIL", "")   # e.g. "2024-12-31"
 
@@ -813,22 +813,35 @@ def build_failure_rows(org: str, repo: str, runs: list[dict]) -> list[dict]:
 # Excel writer
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _sort_rows(rows: list[dict], date_col: str) -> list[dict]:
+    """Return rows sorted latest-first by *date_col* (ISO-8601).  Empty dates go last."""
+    def _key(row: dict) -> str:
+        return row.get(date_col) or "0000"   # empty → sort to bottom
+
+    return sorted(rows, key=_key, reverse=True)
+
+
 def _write_sheet(
     ws,
     columns:        list[str],
     rows:           list[dict],
     conclusion_col: str = "",
+    date_col:       str = "",
 ) -> None:
     """
-    Write a standard data sheet with header + alternating row colours.
+    Write a data sheet sorted latest-first, with full-row colour coding.
 
-    Rows are colour-coded by the value in conclusion_col:
-        failure / timed_out / startup_failure → red
-        success                               → green
-        cancelled / skipped                   → yellow
-        even rows without a conclusion        → light grey-blue
+    Row colours (every cell in the row):
+        failure / timed_out / startup_failure → solid red  background + red  font
+        success                               → solid green background + green font
+        cancelled / skipped                   → yellow background + amber font
+        no conclusion (even rows)             → light grey-blue  (alternating stripe)
     """
-    # Header row
+    # Sort latest first if a date column is provided
+    if date_col:
+        rows = _sort_rows(rows, date_col)
+
+    # ── Header row ────────────────────────────────────────────────────────────
     for col_idx, col_name in enumerate(columns, start=1):
         cell = ws.cell(row=1, column=col_idx, value=col_name)
         cell.font      = _HEADER_FONT
@@ -839,10 +852,24 @@ def _write_sheet(
 
     col_widths = [len(c) + 2 for c in columns]
 
-    # Data rows
+    # ── Data rows ─────────────────────────────────────────────────────────────
     for row_idx, row_data in enumerate(rows, start=2):
         conclusion = str(row_data.get(conclusion_col, "")).lower() if conclusion_col else ""
         is_alt     = (row_idx % 2 == 0)
+
+        # Resolve fill and font for the entire row based on conclusion
+        if conclusion in ("failure", "timed_out", "startup_failure"):
+            row_fill = _FAILURE_FILL
+            row_font = _FAILURE_FONT
+        elif conclusion == "success":
+            row_fill = _SUCCESS_FILL
+            row_font = _SUCCESS_FONT
+        elif conclusion in ("cancelled", "skipped"):
+            row_fill = _WARN_FILL
+            row_font = _WARN_FONT
+        else:
+            row_fill = _ALT_FILL if is_alt else None
+            row_font = None
 
         for col_idx, col_name in enumerate(columns, start=1):
             val  = row_data.get(col_name, "")
@@ -850,28 +877,23 @@ def _write_sheet(
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             cell.border    = _THIN
 
-            # Row-level background
-            if conclusion in ("failure", "timed_out", "startup_failure"):
-                cell.fill = _FAILURE_FILL
-            elif conclusion == "success":
-                cell.fill = _SUCCESS_FILL
-            elif conclusion in ("cancelled", "skipped"):
-                cell.fill = _WARN_FILL
-            elif is_alt:
-                cell.fill = _ALT_FILL
+            # Apply fill to every cell in the row
+            if row_fill:
+                cell.fill = row_fill
 
-            # Conclusion cell gets bold coloured font
-            if col_name == conclusion_col:
-                if conclusion in ("failure", "timed_out", "startup_failure"):
-                    cell.font = _FAILURE_FONT
-                elif conclusion == "success":
-                    cell.font = _SUCCESS_FONT
-                elif conclusion in ("cancelled", "skipped"):
-                    cell.font = _WARN_FONT
+            # Apply font to every cell in the row (bold only on conclusion cell)
+            if row_font:
+                if col_name == conclusion_col:
+                    cell.font = row_font                          # bold
+                else:
+                    cell.font = Font(
+                        color=row_font.color.rgb,
+                        size=10,
+                    )
 
             col_widths[col_idx - 1] = max(col_widths[col_idx - 1], min(len(str(val)), 60))
 
-    # Auto-size columns (capped at 62)
+    # ── Column widths ─────────────────────────────────────────────────────────
     for col_idx, width in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = min(width + 2, 62)
 
@@ -991,11 +1013,13 @@ def save_excel(
         _write_sheet(
             wb["Activity"], ACTIVITY_COLUMNS, activity_rows,
             conclusion_col="Workflow Conclusion",
+            date_col="Date",
         )
         _write_sheet(wb["Access Control"], ACCESS_COLUMNS, access_rows)
         _write_sheet(
             wb["Failure Summary"], FAILURE_COLUMNS, failure_rows,
             conclusion_col="Workflow Conclusion",
+            date_col="Workflow Run ID",   # run IDs are monotonically increasing → latest first
         )
         _write_alerts_sheet(wb["Failure Alerts"], alert_rows)
 
