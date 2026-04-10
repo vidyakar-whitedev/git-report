@@ -1,33 +1,45 @@
 """
-GitHub Activity Report
-======================
-Collects commits, pull requests, and GitHub Actions workflow runs for one or
-more GitHub repositories, joins the data on commit SHA, and writes a
-colour-coded, multi-sheet Excel report.
+GitHub Activity Report — Production Grade
+==========================================
+Collects commits, pull requests, and GitHub Actions workflow runs across one
+repository or an entire GitHub organisation, joins the data on commit SHA, and
+writes a colour-coded multi-sheet Excel report.
 
-Usage (local)
--------------
-    export GH_PAT=<personal_access_token>
-    export GH_REPO=owner/repo
-    python github_activity_report.py
-
-Optional environment variables
--------------------------------
-    GH_OUTPUT        Output file path          (default: github_activity_report.xlsx)
-    GH_MAX_RUNS      Max workflow runs fetched (default: 200)
-    GH_LOOKBACK_DAYS Only report runs from last N days (default: 30)
-    GH_SINCE         ISO-8601 start date filter e.g. 2024-01-01 (overrides LOOKBACK_DAYS)
-    GH_UNTIL         ISO-8601 end date filter   e.g. 2024-12-31
-
-In GitHub Actions GH_REPO / GITHUB_REPOSITORY and GITHUB_TOKEN are set
-automatically — no manual configuration needed beyond optionally setting GH_PAT.
-
-Output sheets
--------------
-  1. Activity        — commits + PRs + workflow runs joined on commit SHA
+Sheets produced
+---------------
+  1. Activity        — commits × PRs × workflow runs (joined on commit SHA)
   2. Access Control  — collaborators and teams with permission levels
-  3. Failure Summary — failed/timed-out runs with diagnostics
-  4. Failure Alerts  — banner + detail table for any failures found
+  3. Failure Summary — failed / timed-out runs with root-cause diagnostics
+  4. Failure Alerts  — banner + summary table for all failures found
+
+Environment variables (all resolved at startup)
+-----------------------------------------------
+Required (at least one):
+  GH_PAT          Personal Access Token  (needs repo + workflow + read:org)
+                  Falls back to GITHUB_TOKEN when running inside GitHub Actions.
+
+  GH_REPO         Single repo in "owner/repo" format.
+                  Omit to scan every repo the token can reach.
+
+  GH_ORG          Organisation login (e.g. "my-company").
+                  When set, only repos belonging to this org are processed.
+                  ┌─────────────────────────────────────────────────────────┐
+                  │  ✏  CHANGE THIS for your organisation                   │
+                  │  Set GH_ORG=<your-github-org-name> in your CI secret    │
+                  │  or in the workflow env block.                           │
+                  └─────────────────────────────────────────────────────────┘
+
+Optional:
+  GH_OUTPUT       Output file path          (default: github_activity_report.xlsx)
+  GH_MAX_RUNS     Max workflow runs fetched per repo (default: 200)
+  GH_LOOKBACK_DAYS  Report runs from last N days (default: 30)
+  GH_SINCE        ISO-8601 start date, e.g. "2024-01-01"  (overrides LOOKBACK_DAYS)
+  GH_UNTIL        ISO-8601 end date,   e.g. "2024-12-31"
+  GH_LOG_LEVEL    Logging verbosity: DEBUG | INFO | WARNING (default: INFO)
+  GH_REPORT_TITLE Custom title shown in the Excel banner row
+                  ┌─────────────────────────────────────────────────────────┐
+                  │  ✏  CHANGE THIS to your organisation / project name     │
+                  └─────────────────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
@@ -40,47 +52,64 @@ import time
 import logging
 import zipfile
 from datetime import datetime, timedelta, timezone
-from typing import Iterator
-
 import requests
 import pandas as pd
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Configuration
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ✏  SECTION 1 — ORGANISATION / PROJECT CONFIGURATION
+#    These are the values most likely to differ between organisations.
+#    Every line marked "✏ CHANGE" should be reviewed before first deployment.
+# ══════════════════════════════════════════════════════════════════════════════
 
-GH_PAT        = os.getenv("GH_PAT") or os.getenv("GITHUB_TOKEN", "")
-GH_REPO       = os.getenv("GH_REPO") or os.getenv("GITHUB_REPOSITORY", "")
+# -- Token & target ------------------------------------------------------------
+
+GH_PAT   = os.getenv("GH_PAT") or os.getenv("GITHUB_TOKEN", "")
+GH_REPO  = os.getenv("GH_REPO") or os.getenv("GITHUB_REPOSITORY", "")
+GH_ORG   = os.getenv("GH_ORG", "")          # ✏ CHANGE: set to your org login
+
+# -- Output & scope ------------------------------------------------------------
+
 OUTPUT        = os.getenv("GH_OUTPUT", "github_activity_report.xlsx")
-MAX_RUNS      = int(os.getenv("GH_MAX_RUNS", "200"))
-LOOKBACK_DAYS = int(os.getenv("GH_LOOKBACK_DAYS", "2"))
-GH_SINCE      = os.getenv("GH_SINCE", "")   # e.g. "2024-01-01"
-GH_UNTIL      = os.getenv("GH_UNTIL", "")   # e.g. "2024-12-31"
+MAX_RUNS      = int(os.getenv("GH_MAX_RUNS",        "200"))   # ✏ CHANGE: increase for busier orgs
+LOOKBACK_DAYS = int(os.getenv("GH_LOOKBACK_DAYS",   "30"))    # ✏ CHANGE: days of history to include
+GH_SINCE      = os.getenv("GH_SINCE", "")    # e.g. "2024-01-01" — overrides LOOKBACK_DAYS
+GH_UNTIL      = os.getenv("GH_UNTIL", "")    # e.g. "2024-12-31"
+
+# -- Report branding -----------------------------------------------------------
+
+REPORT_TITLE = os.getenv(
+    "GH_REPORT_TITLE",
+    "GitHub Activity & Workflow Audit Report",   # ✏ CHANGE: your org / project name
+)
 
 BASE_URL = "https://api.github.com"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger(__name__)
+# ══════════════════════════════════════════════════════════════════════════════
+# ✏  SECTION 2 — EXCEL COLOUR THEME
+#    Change hex colours here to match your organisation's brand palette.
+#    Hex codes must be 6-character RRGGBB (no leading #).
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Excel colour palette
-# ──────────────────────────────────────────────────────────────────────────────
+_BRAND_DARK   = "1F3864"   # ✏ CHANGE: header background       (default: dark navy)
+_BRAND_LIGHT  = "EEF2F7"   # ✏ CHANGE: alternate row stripe     (default: light grey-blue)
+_SUCCESS_BG   = "C6EFCE"   # ✏ CHANGE: success row background   (default: light green)
+_SUCCESS_FG   = "276221"   # ✏ CHANGE: success row text colour  (default: dark green)
+_FAILURE_BG   = "FFC7CE"   # ✏ CHANGE: failure row background   (default: light red)
+_FAILURE_FG   = "9C0006"   # ✏ CHANGE: failure row text colour  (default: dark red)
+_WARN_BG      = "FFEB9C"   # ✏ CHANGE: warning row background   (default: light yellow)
+_WARN_FG      = "9C5700"   # ✏ CHANGE: warning row text colour  (default: amber)
 
-_HEADER_FILL  = PatternFill("solid", fgColor="1F3864")   # dark navy
+_HEADER_FILL  = PatternFill("solid", fgColor=_BRAND_DARK)
 _HEADER_FONT  = Font(color="FFFFFF", bold=True, size=10)
-_ALT_FILL     = PatternFill("solid", fgColor="EEF2F7")   # light grey-blue
-_SUCCESS_FILL = PatternFill("solid", fgColor="C6EFCE")   # light green
-_SUCCESS_FONT = Font(color="276221", bold=True)
-_FAILURE_FILL = PatternFill("solid", fgColor="FFC7CE")   # light red
-_FAILURE_FONT = Font(color="9C0006", bold=True)
-_WARN_FILL    = PatternFill("solid", fgColor="FFEB9C")   # light yellow
-_WARN_FONT    = Font(color="9C5700")
+_ALT_FILL     = PatternFill("solid", fgColor=_BRAND_LIGHT)
+_SUCCESS_FILL = PatternFill("solid", fgColor=_SUCCESS_BG)
+_SUCCESS_FONT = Font(color=_SUCCESS_FG, bold=True, size=10)
+_FAILURE_FILL = PatternFill("solid", fgColor=_FAILURE_BG)
+_FAILURE_FONT = Font(color=_FAILURE_FG, bold=True, size=10)
+_WARN_FILL    = PatternFill("solid", fgColor=_WARN_BG)
+_WARN_FONT    = Font(color=_WARN_FG, size=10)
 _THIN         = Border(
     left=Side(style="thin",   color="D0D7DE"),
     right=Side(style="thin",  color="D0D7DE"),
@@ -88,9 +117,70 @@ _THIN         = Border(
     bottom=Side(style="thin", color="D0D7DE"),
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ✏  SECTION 3 — FAILURE FIX-HINT RULES
+#    Each entry: ([keyword_list], "human-readable suggestion")
+#    Add or edit rules to match the tech stack used in your organisation.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_FIX_RULES: list[tuple[list[str], str]] = [
+    # ✏ CHANGE: add keywords specific to your build tools / frameworks
+    (
+        ["install", "pip", "npm", "yarn", "poetry", "dependency",
+         "module not found", "importerror", "modulenotfounderror", "no module"],
+        "Dependency error — run `pip install -r requirements.txt` or `npm install` "
+        "and verify package versions.",
+    ),
+    (
+        ["permission", "forbidden", "401", "403", "unauthorized",
+         "access denied", "secret", "token", "credential"],
+        "Auth/permission error — verify GH_PAT scopes and that repository "
+        "secrets are correctly configured.",
+    ),
+    (
+        ["timeout", "timed out", "timed_out", "deadline exceeded"],
+        "Timeout — increase job `timeout-minutes`, optimise long-running steps, "
+        "or split the job.",
+    ),
+    (
+        ["syntax", "syntaxerror", "parse error", "unexpected token",
+         "invalid syntax", "yaml", "yml"],
+        "Syntax error — review workflow YAML and scripts for syntax mistakes.",
+    ),
+    (
+        ["docker", "container", "image", "pull"],
+        "Docker/container error — verify image name/tag is correct and accessible.",
+    ),
+    (
+        ["test", "assert", "spec", "jest", "pytest", "unittest", "rspec", "coverage"],
+        "Test failure — review failing test output and fix the failing assertions.",
+    ),
+    (
+        ["build", "compile", "tsc", "webpack", "gradle", "maven", "make"],
+        "Build error — check compiler output in logs and fix the source.",
+    ),
+    (
+        ["deploy", "release", "publish", "helm", "kubectl", "terraform"],
+        "Deployment error — verify credentials, target environment, and release config.",
+    ),
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Logging
+# ══════════════════════════════════════════════════════════════════════════════
+
+_LOG_LEVEL = os.getenv("GH_LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ══════════════════════════════════════════════════════════════════════════════
 # HTTP client
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _build_session() -> requests.Session:
     """Create an authenticated requests session for the GitHub REST API."""
@@ -121,16 +211,20 @@ def _wait_for_rate_limit(headers: dict) -> None:
 
 def _get(url: str, params: dict | None = None) -> dict | list | None:
     """
-    Single GET request with automatic rate-limit retry.
+    Single GET with automatic rate-limit retry.
 
     Returns:
         Parsed JSON body, or None on 404.
-
     Raises:
-        RuntimeError: if all 5 retries are exhausted.
+        RuntimeError: after 5 failed retries.
     """
-    for _ in range(5):
-        resp = SESSION.get(url, params=params or {}, timeout=30)
+    for attempt in range(5):
+        try:
+            resp = SESSION.get(url, params=params or {}, timeout=30)
+        except requests.RequestException as exc:
+            log.warning("GET %s attempt %d failed: %s", url, attempt + 1, exc)
+            time.sleep(2 ** attempt)
+            continue
         if resp.status_code == 403 and "rate limit" in resp.text.lower():
             _wait_for_rate_limit(resp.headers)
             continue
@@ -143,39 +237,43 @@ def _get(url: str, params: dict | None = None) -> dict | list | None:
 
 def _paginate(url: str, params: dict | None = None, max_items: int = 0) -> list:
     """
-    Consume GitHub's Link-header pagination and return all items.
+    Follow GitHub's Link-header pagination and return all items.
 
-    Unwraps known envelope keys (workflow_runs, jobs, repositories).
-    Stops early when max_items is reached (0 = unlimited).
-    Returns an empty list on 403/404 (no access).
+    Unwraps common envelope keys: workflow_runs, jobs, repositories.
+    Returns an empty list on 403 / 404 (no access) rather than raising.
     """
     params = dict(params or {})
     params.setdefault("per_page", 100)
-    items: list = []
+    items:    list      = []
     page_url: str | None = url
 
     while page_url:
-        for _ in range(5):
-            resp = SESSION.get(page_url, params=params, timeout=30)
+        for attempt in range(5):
+            try:
+                resp = SESSION.get(page_url, params=params, timeout=30)
+            except requests.RequestException as exc:
+                log.warning("Paginate %s attempt %d failed: %s", page_url, attempt + 1, exc)
+                time.sleep(2 ** attempt)
+                continue
             if resp.status_code == 403 and "rate limit" in resp.text.lower():
                 _wait_for_rate_limit(resp.headers)
                 continue
             if resp.status_code in (403, 404):
-                return items          # no access — return what we have
+                return items
             resp.raise_for_status()
             break
 
         payload = resp.json()
         if isinstance(payload, dict):
-            for envelope_key in ("workflow_runs", "jobs", "repositories"):
-                if envelope_key in payload:
-                    payload = payload[envelope_key]
+            for key in ("workflow_runs", "jobs", "repositories"):
+                if key in payload:
+                    payload = payload[key]
                     break
             else:
                 payload = []
 
         items.extend(payload)
-        params = {}   # params are encoded in the Link: next URL
+        params = {}   # Link: next already encodes query params
 
         if max_items and len(items) >= max_items:
             return items[:max_items]
@@ -184,23 +282,27 @@ def _paginate(url: str, params: dict | None = None, max_items: int = 0) -> list:
 
     return items
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # Repository discovery
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_repos() -> list[dict]:
     """
-    Return a list of GitHub repository objects.
+    Return a list of GitHub repository objects to process.
 
-    If GH_REPO is set, returns only that single repository.
-    Otherwise fetches all repositories accessible to the authenticated token.
+    Resolution order:
+      1. GH_REPO  — single specific repo (owner/repo format)
+      2. GH_ORG   — all repos in the named organisation
+      3. fallback — all repos accessible to the authenticated token
+
+    ✏  CHANGE: if your org uses GitHub Enterprise Server, replace BASE_URL
+       at the top of this file with your GHES API endpoint, e.g.:
+       https://github.mycompany.com/api/v3
     """
     if GH_REPO:
         if "/" not in GH_REPO:
             log.error(
-                "GH_REPO must be in 'owner/repo' format.  Got: %r\n"
-                "  Example: export GH_REPO=octocat/Hello-World",
-                GH_REPO,
+                "GH_REPO must be 'owner/repo' format.  Got: %r", GH_REPO
             )
             sys.exit(1)
         owner, name = GH_REPO.split("/", 1)
@@ -208,25 +310,35 @@ def fetch_repos() -> list[dict]:
         if data is None:
             log.error("Repository not found or token lacks access: %s", GH_REPO)
             sys.exit(1)
+        log.info("Single-repo mode: %s", GH_REPO)
         return [data]
 
-    log.info("GH_REPO not set — fetching all accessible repositories …")
-    repos = _paginate(
-        f"{BASE_URL}/user/repos",
-        params={"affiliation": "owner,collaborator,organization_member"},
-    )
+    if GH_ORG:
+        log.info("Organisation mode: fetching repos for org '%s' …", GH_ORG)
+        repos = _paginate(
+            f"{BASE_URL}/orgs/{GH_ORG}/repos",
+            params={"type": "all"},   # ✏ CHANGE: use "public" to skip private repos
+        )
+    else:
+        log.info("User mode: fetching all accessible repositories …")
+        repos = _paginate(
+            f"{BASE_URL}/user/repos",
+            params={"affiliation": "owner,collaborator,organization_member"},
+        )
+
     if not repos:
         log.error(
             "No repositories found.  "
-            "Check that GH_PAT has 'repo' scope and GH_REPO is correct."
+            "Check that GH_PAT has the required scopes and GH_ORG / GH_REPO is correct."
         )
         sys.exit(1)
+
     log.info("  %d repository/repositories found", len(repos))
     return repos
 
 
 def _repo_meta(repo: dict) -> dict:
-    """Extract a flat metadata dict from a raw GitHub repo object."""
+    """Extract a normalised metadata dict from a raw GitHub repo object."""
     return {
         "org":            (repo.get("owner") or {}).get("login", ""),
         "name":           repo.get("name", ""),
@@ -235,9 +347,9 @@ def _repo_meta(repo: dict) -> dict:
         "default_branch": repo.get("default_branch", "main"),
     }
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # Data fetchers
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_branches(org: str, repo: str) -> dict[str, str]:
     """Return {branch_name: head_sha} for every branch in the repository."""
@@ -247,10 +359,10 @@ def fetch_branches(org: str, repo: str) -> dict[str, str]:
 
 def fetch_commits(org: str, repo: str, branches: dict[str, str]) -> list[dict]:
     """
-    Fetch all unique commits across every branch.
+    Fetch all unique commits across every branch, de-duplicated by SHA.
 
-    De-duplicates by SHA so a commit reachable from multiple branches is
-    only returned once (with the first branch it was seen on).
+    A commit reachable from multiple branches is recorded once, attributed
+    to the first branch it was encountered on.
     """
     seen: dict[str, dict] = {}
     for branch_name in branches:
@@ -276,9 +388,9 @@ def fetch_commits(org: str, repo: str, branches: dict[str, str]) -> list[dict]:
 
 def fetch_pull_requests(org: str, repo: str) -> list[dict]:
     """
-    Fetch all pull requests (open, closed, and merged).
+    Fetch all pull requests (open, closed, merged).
 
-    Returns fields needed for SHA-based join and Activity columns.
+    Returns the fields required for SHA-based join and Activity columns.
     """
     prs = _paginate(
         f"{BASE_URL}/repos/{org}/{repo}/pulls",
@@ -302,10 +414,10 @@ def fetch_pull_requests(org: str, repo: str) -> list[dict]:
 
 def _date_filter_bounds() -> tuple[datetime, datetime | None]:
     """
-    Resolve the run date-filter bounds from env vars.
+    Resolve date-filter bounds from environment variables.
 
-    Priority: GH_SINCE / GH_UNTIL  >  GH_LOOKBACK_DAYS.
-    Returns (since_dt, until_dt) where until_dt may be None (= no upper bound).
+    Priority:  GH_SINCE / GH_UNTIL  >  GH_LOOKBACK_DAYS
+    Returns:   (since_dt, until_dt) — until_dt is None when no upper bound.
     """
     until_dt: datetime | None = None
 
@@ -323,16 +435,17 @@ def _date_filter_bounds() -> tuple[datetime, datetime | None]:
 
 
 def _parse_iso(ts: str) -> datetime:
-    """Parse an ISO-8601 timestamp from the GitHub API (handles Z suffix)."""
+    """Parse a GitHub API ISO-8601 timestamp (handles trailing Z)."""
     return datetime.fromisoformat(ts.rstrip("Z") + "+00:00")
 
 
 def _fetch_failure_detail(org: str, repo: str, run_id: int) -> dict:
     """
-    Drill into a failed run's jobs/steps and attempt to extract a log snippet.
+    Drill into a failed run's jobs/steps and extract a log snippet.
 
-    Returns a dict with keys:
-        failed_job, failed_step, log_snippet, error_line, suggested_fix
+    Log download is best-effort — some token scopes cannot access raw logs.
+    Returns a dict with: failed_job, failed_step, log_snippet, error_line,
+    suggested_fix.
     """
     jobs = _paginate(f"{BASE_URL}/repos/{org}/{repo}/actions/runs/{run_id}/jobs")
 
@@ -350,7 +463,7 @@ def _fetch_failure_detail(org: str, repo: str, run_id: int) -> dict:
                     break
             break
 
-    # Best-effort: download the log zip and find error lines
+    # Attempt to download and parse the log zip
     log_url = f"{BASE_URL}/repos/{org}/{repo}/actions/runs/{run_id}/logs"
     try:
         resp = SESSION.get(log_url, timeout=30, allow_redirects=True)
@@ -360,6 +473,8 @@ def _fetch_failure_detail(org: str, repo: str, run_id: int) -> dict:
                 for fname in zf.namelist():
                     if target in fname.lower() or not failed_job:
                         raw = zf.read(fname).decode("utf-8", errors="replace")
+                        # ✏ CHANGE: extend this keyword list with error patterns
+                        #   specific to your stack (e.g. "AssertionError", "FATAL")
                         error_lines = [
                             ln.strip() for ln in raw.splitlines()
                             if any(
@@ -378,8 +493,8 @@ def _fetch_failure_detail(org: str, repo: str, run_id: int) -> dict:
                                     error_line = f"Line {m.group(1)}"
                                     break
                         break
-    except Exception:
-        pass   # log download is best-effort
+    except Exception as exc:
+        log.debug("Log download skipped for run %d: %s", run_id, exc)
 
     return {
         "failed_job":    failed_job,
@@ -390,57 +505,14 @@ def _fetch_failure_detail(org: str, repo: str, run_id: int) -> dict:
     }
 
 
-# Fix-hint rules keyed by error keywords
-_FIX_RULES: list[tuple[list[str], str]] = [
-    (
-        ["install", "pip", "npm", "yarn", "dependency", "package",
-         "module not found", "importerror", "modulenotfounderror", "no module"],
-        "Dependency error — run `pip install -r requirements.txt` or `npm install` "
-        "and verify package versions.",
-    ),
-    (
-        ["permission", "forbidden", "401", "403", "unauthorized",
-         "access denied", "secret", "token", "credential"],
-        "Auth/permission error — check that GH_PAT has the required scopes and "
-        "that repository secrets are correctly configured.",
-    ),
-    (
-        ["timeout", "timed out", "timed_out", "deadline exceeded"],
-        "Timeout — increase job `timeout-minutes`, optimise long-running steps, "
-        "or split the job.",
-    ),
-    (
-        ["syntax", "syntaxerror", "parse error", "unexpected token",
-         "invalid syntax", "yaml", "yml"],
-        "Syntax error — review the workflow YAML and any scripts for syntax mistakes.",
-    ),
-    (
-        ["docker", "container", "image", "pull"],
-        "Docker/container error — verify the image name/tag is correct and accessible.",
-    ),
-    (
-        ["test", "assert", "spec", "jest", "pytest", "unittest", "rspec"],
-        "Test failure — review the failing test output and fix the failing assertions.",
-    ),
-    (
-        ["build", "compile", "tsc", "webpack", "gradle", "maven"],
-        "Build error — check compiler output in the logs and fix the source.",
-    ),
-    (
-        ["deploy", "release", "publish"],
-        "Deployment error — verify credentials, target environment, and release config.",
-    ),
-]
-
-
 def _suggest_fix(conclusion: str, job: str, step: str, snippet: str) -> str:
-    """Return a human-readable fix suggestion based on the failure context."""
+    """Map failure context to a human-readable fix suggestion using _FIX_RULES."""
     if conclusion == "timed_out":
         return "Timeout — increase job `timeout-minutes` or optimise the long-running step."
     if conclusion == "startup_failure":
         return "Workflow startup failure — check YAML syntax and runner availability."
     if conclusion == "cancelled":
-        return "Run was cancelled manually or by a newer push — no fix needed unless unintended."
+        return "Run was cancelled manually or by a newer push — no action needed unless unintended."
 
     haystack = " ".join([job, step, snippet]).lower()
     for keywords, suggestion in _FIX_RULES:
@@ -452,14 +524,12 @@ def _suggest_fix(conclusion: str, job: str, step: str, snippet: str) -> str:
 
 def fetch_workflow_runs(org: str, repo: str) -> list[dict]:
     """
-    Fetch workflow runs, filtered by the configured date window.
+    Fetch workflow runs within the configured date window.
 
-    Fetches up to MAX_RUNS most-recent runs, then filters client-side
-    to the [since_dt, until_dt] window derived from GH_SINCE / GH_UNTIL /
-    GH_LOOKBACK_DAYS.  Drills into failed runs for diagnostics.
+    Pulls up to MAX_RUNS from the API then filters client-side to
+    [since_dt, until_dt].  Failed runs are enriched with job/step diagnostics.
     """
     since_dt, until_dt = _date_filter_bounds()
-
     since_label = since_dt.strftime("%Y-%m-%d")
     until_label = until_dt.strftime("%Y-%m-%d") if until_dt else "now"
     log.info(
@@ -472,8 +542,8 @@ def fetch_workflow_runs(org: str, repo: str) -> list[dict]:
         max_items=MAX_RUNS,
     )
 
-    # Apply date window filter
-    filtered: list[dict] = []
+    # Filter to the requested date window
+    filtered = []
     for run in raw_runs:
         ts_str = run.get("created_at") or run.get("run_started_at") or ""
         if not ts_str:
@@ -491,7 +561,6 @@ def fetch_workflow_runs(org: str, repo: str) -> list[dict]:
     for run in filtered:
         conclusion = run.get("conclusion") or ""
         run_id     = run["id"]
-        detail: dict
 
         if conclusion in ("failure", "timed_out", "startup_failure"):
             log.info("      fetching failure detail for run %d …", run_id)
@@ -535,7 +604,7 @@ def fetch_workflow_runs(org: str, repo: str) -> list[dict]:
 
         if failure_reason:
             log.warning(
-                "WORKFLOW FAILURE DETECTED in %s/%s  (Run ID: %d)  — %s",
+                "WORKFLOW FAILURE in %s/%s  (Run ID: %d)  — %s",
                 org, repo, run_id, failure_reason,
             )
 
@@ -546,6 +615,7 @@ def fetch_workflow_runs(org: str, repo: str) -> list[dict]:
             "conclusion":     conclusion,
             "event":          run.get("event", ""),
             "head_sha":       run.get("head_sha", ""),
+            "run_started_at": run.get("run_started_at", ""),
             "run_author":     (
                 run.get("triggering_actor") or run.get("actor") or {}
             ).get("login", ""),
@@ -558,13 +628,20 @@ def fetch_workflow_runs(org: str, repo: str) -> list[dict]:
 
 def fetch_access_control(org: str, repo: str) -> list[dict]:
     """
-    Fetch collaborators (users) and teams with their permission levels.
+    Fetch collaborators (individual users) and teams with permission levels.
 
-    Returns an empty list for personal repos where team endpoints return 404.
+    Returns an empty list for personal repos — team endpoints return 404
+    which _paginate handles gracefully.
+
+    ✏  CHANGE: If your org uses SAML SSO, the collaborator list only includes
+       members who have authorised the token — this is a GitHub API limitation.
     """
     records: list[dict] = []
+    _PERM_MAP = {
+        "admin": "Admin", "maintain": "Maintain",
+        "push": "Write", "triage": "Triage", "pull": "Read",
+    }
 
-    # Individual collaborators
     for user in _paginate(
         f"{BASE_URL}/repos/{org}/{repo}/collaborators",
         params={"affiliation": "all"},
@@ -588,11 +665,6 @@ def fetch_access_control(org: str, repo: str) -> list[dict]:
             "can_delete":  "Yes" if perms.get("admin") else "No",
         })
 
-    # Teams (org repos only; personal repos return 404 which _paginate ignores)
-    _PERM_MAP = {
-        "admin": "Admin", "maintain": "Maintain",
-        "push": "Write", "triage": "Triage", "pull": "Read",
-    }
     for team in _paginate(f"{BASE_URL}/repos/{org}/{repo}/teams"):
         perm  = team.get("permission", "pull")
         level = _PERM_MAP.get(perm, perm.capitalize())
@@ -606,20 +678,24 @@ def fetch_access_control(org: str, repo: str) -> list[dict]:
 
     return records
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Column definitions
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ✏  SECTION 4 — COLUMN DEFINITIONS
+#    Add, remove, or rename columns here.
+#    Column names here must exactly match the keys used in the row-builder
+#    functions below.
+# ══════════════════════════════════════════════════════════════════════════════
 
 ACTIVITY_COLUMNS = [
+    # Repository metadata
     "Repository", "Organization", "Visibility", "Default Branch",
     # Commit
     "Commit ID", "Commit Message", "Author", "Date", "Branch",
     # Pull Request
     "PR ID", "PR Title", "PR Author", "PR Status", "PR Merged", "PR Merge Date",
-    # Workflow
+    # Workflow run
     "Workflow Name", "Workflow Run ID", "Trigger Event",
-    "Workflow Status", "Workflow Conclusion",
-    # Diagnostics
+    "Run Started At", "Workflow Status", "Workflow Conclusion",
+    # Failure diagnostics
     "Failure Reason", "Failed Job", "Failed Step", "Error Line", "Suggested Fix",
 ]
 
@@ -631,19 +707,19 @@ ACCESS_COLUMNS = [
 FAILURE_COLUMNS = [
     "Repository", "Organization",
     "Workflow Name", "Workflow Run ID", "Trigger Event",
-    "Workflow Status", "Workflow Conclusion",
+    "Run Started At", "Workflow Status", "Workflow Conclusion",
     "Failure Reason", "Failed Job", "Failed Step", "Error Line", "Suggested Fix",
 ]
 
 ALERTS_COLUMNS = [
     "#", "Repository", "Organization", "Workflow Name", "Run ID",
-    "Trigger", "Conclusion", "Failure Reason", "Failed Job", "Failed Step",
-    "Error Line", "Suggested Fix",
+    "Trigger", "Run Started At", "Conclusion",
+    "Failure Reason", "Failed Job", "Failed Step", "Error Line", "Suggested Fix",
 ]
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # Dataset assembly — join on commit SHA
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def build_activity_rows(
     meta:    dict,
@@ -652,19 +728,21 @@ def build_activity_rows(
     runs:    list[dict],
 ) -> list[dict]:
     """
-    Join commits, PRs, and workflow runs using commit SHA as the primary key.
+    Produce the Activity sheet rows by joining commits, PRs and workflow runs
+    on commit SHA.
 
-    Strategy:
-    1. Commits are the primary anchor; each gets its matched PRs and runs.
-    2. PRs not matched to any commit are appended as orphan rows.
-    3. Workflow runs not matched to any commit are appended as orphan rows.
+    Join strategy:
+      1. Commits are the primary anchor.  Each commit is expanded by its
+         matched PRs × matched workflow runs (Cartesian product per commit).
+      2. PRs whose SHA doesn't match any fetched commit appear as orphan rows.
+      3. Workflow runs whose head_sha doesn't match any commit appear as orphan rows.
     """
     org  = meta["org"]
     repo = meta["name"]
     vis  = meta["visibility"]
     defb = meta["default_branch"]
 
-    # Build SHA lookup maps
+    # Build SHA lookup indexes
     sha_to_prs: dict[str, list[dict]] = {}
     for pr in prs:
         for key in ("merge_sha", "head_sha"):
@@ -700,17 +778,18 @@ def build_activity_rows(
     def _run_cols(run: dict | None) -> dict:
         if not run:
             return {
-                "Workflow Name": "",   "Workflow Run ID": "",
-                "Trigger Event": "",   "Workflow Status": "",
-                "Workflow Conclusion": "",
-                "Failure Reason": "",  "Failed Job": "",
-                "Failed Step": "",     "Error Line": "",
+                "Workflow Name": "",    "Workflow Run ID": "",
+                "Trigger Event": "",    "Run Started At": "",
+                "Workflow Status": "",  "Workflow Conclusion": "",
+                "Failure Reason": "",   "Failed Job": "",
+                "Failed Step": "",      "Error Line": "",
                 "Suggested Fix": "",
             }
         return {
             "Workflow Name":       run["workflow"],
             "Workflow Run ID":     run["run_id"],
             "Trigger Event":       run["event"],
+            "Run Started At":      run.get("run_started_at", ""),
             "Workflow Status":     run["status"],
             "Workflow Conclusion": run["conclusion"],
             "Failure Reason":      run.get("failure_reason", ""),
@@ -720,7 +799,7 @@ def build_activity_rows(
             "Suggested Fix":       run.get("suggested_fix", ""),
         }
 
-    # ── 1. Commit-anchored rows ───────────────────────────────────────────────
+    # 1. Commit-anchored rows
     for commit in commits:
         sha          = commit["sha"]
         matched_prs  = sha_to_prs.get(sha)  or [None]
@@ -746,42 +825,42 @@ def build_activity_rows(
                     covered_runs.add(run["run_id"])
                 rows.append({**base, **_pr_cols(pr), **_run_cols(run)})
 
-    # ── 2. Orphan PRs ─────────────────────────────────────────────────────────
+    # 2. Orphan PRs (no matching commit in window)
     for pr in prs:
         if pr["pr_id"] not in covered_prs:
             rows.append({
-                "Repository": repo, "Organization": org,
-                "Visibility": vis,  "Default Branch": defb,
-                "Commit ID": "", "Commit Message": "",
-                "Author": "", "Date": "", "Branch": "",
-                **_pr_cols(pr), **_run_cols(None),
+                "Repository": repo,   "Organization": org,
+                "Visibility": vis,    "Default Branch": defb,
+                "Commit ID": "",      "Commit Message": "",
+                "Author": "",         "Date": "",         "Branch": "",
+                **_pr_cols(pr),       **_run_cols(None),
             })
 
-    # ── 3. Orphan workflow runs ───────────────────────────────────────────────
+    # 3. Orphan workflow runs (no matching commit in window)
     for run in runs:
         if run["run_id"] not in covered_runs:
             rows.append({
-                "Repository": repo, "Organization": org,
-                "Visibility": vis,  "Default Branch": defb,
+                "Repository": repo,   "Organization": org,
+                "Visibility": vis,    "Default Branch": defb,
                 "Commit ID":  run["head_sha"],
                 "Commit Message": "", "Author": run["run_author"],
-                "Date": "", "Branch": "",
-                **_pr_cols(None), **_run_cols(run),
+                "Date": "",           "Branch": "",
+                **_pr_cols(None),     **_run_cols(run),
             })
 
     return rows
 
 
 def build_access_rows(org: str, repo: str, access: list[dict]) -> list[dict]:
-    """Flatten access-control records into the ACCESS_COLUMNS shape."""
+    """Flatten access-control records into ACCESS_COLUMNS shape."""
     return [
         {
-            "Repository":       repo,
-            "Organization":     org,
-            "User/Team Name":   a["entity_name"],
-            "Type":             a["entity_type"],
-            "Permission Level": a["permission"],
-            "Has Admin":        a["has_admin"],
+            "Repository":        repo,
+            "Organization":      org,
+            "User/Team Name":    a["entity_name"],
+            "Type":              a["entity_type"],
+            "Permission Level":  a["permission"],
+            "Has Admin":         a["has_admin"],
             "Has Delete Access": a["can_delete"],
         }
         for a in access
@@ -789,7 +868,7 @@ def build_access_rows(org: str, repo: str, access: list[dict]) -> list[dict]:
 
 
 def build_failure_rows(org: str, repo: str, runs: list[dict]) -> list[dict]:
-    """Extract only failed/timed-out runs into the FAILURE_COLUMNS shape."""
+    """Extract failed / timed-out runs into FAILURE_COLUMNS shape."""
     return [
         {
             "Repository":          repo,
@@ -797,6 +876,7 @@ def build_failure_rows(org: str, repo: str, runs: list[dict]) -> list[dict]:
             "Workflow Name":       run["workflow"],
             "Workflow Run ID":     run["run_id"],
             "Trigger Event":       run["event"],
+            "Run Started At":      run.get("run_started_at", ""),
             "Workflow Status":     run["status"],
             "Workflow Conclusion": run["conclusion"],
             "Failure Reason":      run.get("failure_reason", ""),
@@ -809,16 +889,13 @@ def build_failure_rows(org: str, repo: str, runs: list[dict]) -> list[dict]:
         if run["conclusion"] in ("failure", "timed_out", "startup_failure")
     ]
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # Excel writer
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _sort_rows(rows: list[dict], date_col: str) -> list[dict]:
-    """Return rows sorted latest-first by *date_col* (ISO-8601).  Empty dates go last."""
-    def _key(row: dict) -> str:
-        return row.get(date_col) or "0000"   # empty → sort to bottom
-
-    return sorted(rows, key=_key, reverse=True)
+    """Sort rows latest-first by *date_col* (ISO-8601).  Empty dates go last."""
+    return sorted(rows, key=lambda r: r.get(date_col) or "0000", reverse=True)
 
 
 def _write_sheet(
@@ -829,35 +906,38 @@ def _write_sheet(
     date_col:       str = "",
 ) -> None:
     """
-    Write a data sheet sorted latest-first, with full-row colour coding.
+    Write a data sheet sorted latest-first with full-row colour coding.
 
-    Row colours (every cell in the row):
-        failure / timed_out / startup_failure → solid red  background + red  font
-        success                               → solid green background + green font
-        cancelled / skipped                   → yellow background + amber font
-        no conclusion (even rows)             → light grey-blue  (alternating stripe)
+    Every cell in a row receives the same background fill AND the matching
+    coloured font so the entire row reads as green (success), red (failure),
+    or yellow (cancelled/skipped).  The conclusion cell is additionally bold.
+
+    Row colours:
+        failure / timed_out / startup_failure  →  red
+        success                                →  green
+        cancelled / skipped                    →  yellow
+        no conclusion (even rows)              →  light grey-blue stripe
     """
-    # Sort latest first if a date column is provided
     if date_col:
         rows = _sort_rows(rows, date_col)
 
-    # ── Header row ────────────────────────────────────────────────────────────
+    # Header
     for col_idx, col_name in enumerate(columns, start=1):
         cell = ws.cell(row=1, column=col_idx, value=col_name)
         cell.font      = _HEADER_FONT
         cell.fill      = _HEADER_FILL
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border    = _THIN
-    ws.row_dimensions[1].height = 28
+    ws.row_dimensions[1].height = 30
 
     col_widths = [len(c) + 2 for c in columns]
 
-    # ── Data rows ─────────────────────────────────────────────────────────────
+    # Data rows
     for row_idx, row_data in enumerate(rows, start=2):
         conclusion = str(row_data.get(conclusion_col, "")).lower() if conclusion_col else ""
         is_alt     = (row_idx % 2 == 0)
 
-        # Resolve fill and font for the entire row based on conclusion
+        # Resolve fill + font for the whole row from the conclusion value
         if conclusion in ("failure", "timed_out", "startup_failure"):
             row_fill = _FAILURE_FILL
             row_font = _FAILURE_FONT
@@ -877,23 +957,18 @@ def _write_sheet(
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             cell.border    = _THIN
 
-            # Apply fill to every cell in the row
             if row_fill:
                 cell.fill = row_fill
 
-            # Apply font to every cell in the row (bold only on conclusion cell)
             if row_font:
+                # Bold only on the conclusion cell; regular weight everywhere else
                 if col_name == conclusion_col:
-                    cell.font = row_font                          # bold
+                    cell.font = row_font
                 else:
-                    cell.font = Font(
-                        color=row_font.color.rgb,
-                        size=10,
-                    )
+                    cell.font = Font(color=row_font.color.rgb, size=10)
 
             col_widths[col_idx - 1] = max(col_widths[col_idx - 1], min(len(str(val)), 60))
 
-    # ── Column widths ─────────────────────────────────────────────────────────
     for col_idx, width in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = min(width + 2, 62)
 
@@ -904,18 +979,17 @@ def _write_sheet(
 
 def _write_alerts_sheet(ws, alert_rows: list[dict]) -> None:
     """
-    Write the Failure Alerts sheet with a banner, timestamp, and detail table.
+    Write the Failure Alerts sheet.
 
     Layout:
-        Row 1  — merged banner cell: "⚠  N WORKFLOW FAILURE(S) DETECTED"
+        Row 1  — merged banner: "⚠  N FAILURE(S)" or "✔  NO FAILURES"
         Row 2  — generated timestamp (right-aligned)
         Row 3  — column headers
-        Row 4+ — one alert per row, highlighted in red
+        Row 4+ — one alert per row, all red
     """
     n_cols = len(ALERTS_COLUMNS)
     total  = len(alert_rows)
 
-    # Banner
     banner_text = (
         f"⚠   {total} WORKFLOW FAILURE(S) DETECTED"
         if total else "✔   NO WORKFLOW FAILURES DETECTED"
@@ -932,15 +1006,13 @@ def _write_alerts_sheet(ws, alert_rows: list[dict]) -> None:
     banner.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 36
 
-    # Generated timestamp
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=n_cols)
-    ts = ws.cell(row=2, column=1, value=f"Generated: {now_utc}")
+    ts = ws.cell(row=2, column=1, value=f"Generated: {now_utc}  |  {REPORT_TITLE}")
     ts.font      = Font(color="9C0006" if total else "375623", italic=True, size=9)
     ts.alignment = Alignment(horizontal="right")
     ws.row_dimensions[2].height = 14
 
-    # Column headers (row 3)
     HDR_FILL = PatternFill("solid", fgColor="7B0000")
     HDR_FONT = Font(color="FFFFFF", bold=True, size=10)
     for col_idx, col_name in enumerate(ALERTS_COLUMNS, start=1):
@@ -951,18 +1023,17 @@ def _write_alerts_sheet(ws, alert_rows: list[dict]) -> None:
         cell.border    = _THIN
     ws.row_dimensions[3].height = 24
 
-    # Data rows (row 4+)
     ROW_FILL = PatternFill("solid", fgColor="FFC7CE")
     ALT_FILL = PatternFill("solid", fgColor="FFD7DC")
-    ROW_FONT = Font(color="9C0006")
+    ROW_FONT = Font(color="9C0006", size=10)
     col_widths = [len(c) + 2 for c in ALERTS_COLUMNS]
 
     for row_idx, row_data in enumerate(alert_rows, start=4):
-        row_fill = ALT_FILL if row_idx % 2 == 0 else ROW_FILL
+        fill = ALT_FILL if row_idx % 2 == 0 else ROW_FILL
         for col_idx, col_name in enumerate(ALERTS_COLUMNS, start=1):
             val  = row_data.get(col_name, "")
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.fill      = row_fill
+            cell.fill      = fill
             cell.font      = ROW_FONT
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             cell.border    = _THIN
@@ -978,6 +1049,94 @@ def _write_alerts_sheet(ws, alert_rows: list[dict]) -> None:
         )
 
 
+def _write_cover_sheet(ws) -> None:
+    """
+    Write a Cover / Summary sheet as the first visible tab.
+
+    ✏  CHANGE: update the contact details and logo colour below.
+    """
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 4
+    ws.column_dimensions["B"].width = 32
+    ws.column_dimensions["C"].width = 50
+
+    now_utc  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    since_dt, until_dt = _date_filter_bounds()
+    date_range = (
+        f"{since_dt.strftime('%Y-%m-%d')} → "
+        f"{until_dt.strftime('%Y-%m-%d') if until_dt else 'now'}"
+    )
+
+    # ── Title banner ──────────────────────────────────────────────────────────
+    ws.merge_cells("B2:C2")
+    title_cell = ws.cell(row=2, column=2, value=REPORT_TITLE)
+    title_cell.font      = Font(color="FFFFFF", bold=True, size=18)
+    title_cell.fill      = PatternFill("solid", fgColor=_BRAND_DARK)
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 44
+
+    # ── Info block ────────────────────────────────────────────────────────────
+    info_rows = [
+        ("Generated",    now_utc),
+        ("Date Range",   date_range),
+        ("Organisation", GH_ORG or GH_REPO or "All accessible repos"),
+        ("Max Runs",     str(MAX_RUNS)),
+        # ✏ CHANGE: replace with your team's contact details
+        ("Maintained by", "DevOps / Platform Engineering team"),
+        ("Contact",       "devops@yourcompany.com"),
+    ]
+
+    for i, (label, value) in enumerate(info_rows, start=4):
+        label_cell = ws.cell(row=i, column=2, value=label)
+        value_cell = ws.cell(row=i, column=3, value=value)
+        label_cell.font      = Font(bold=True, size=10, color=_BRAND_DARK)
+        value_cell.font      = Font(size=10)
+        label_cell.alignment = Alignment(vertical="center")
+        value_cell.alignment = Alignment(vertical="center")
+        ws.row_dimensions[i].height = 18
+
+    # ── Sheet legend ──────────────────────────────────────────────────────────
+    legend_title = ws.cell(row=11, column=2, value="Sheets in this workbook")
+    legend_title.font      = Font(bold=True, size=11, color=_BRAND_DARK)
+    legend_title.alignment = Alignment(vertical="center")
+    ws.row_dimensions[11].height = 20
+
+    legends = [
+        ("Activity",        "All commits, PRs, and workflow runs — latest first"),
+        ("Access Control",  "Collaborators and teams with permission levels"),
+        ("Failure Summary", "All failed/timed-out runs with root-cause diagnostics"),
+        ("Failure Alerts",  "Banner + alert table for all failures detected"),
+    ]
+    for i, (sheet, desc) in enumerate(legends, start=12):
+        sheet_cell = ws.cell(row=i, column=2, value=sheet)
+        desc_cell  = ws.cell(row=i, column=3, value=desc)
+        sheet_cell.font      = Font(bold=True, size=10)
+        desc_cell.font       = Font(size=10)
+        sheet_cell.alignment = Alignment(vertical="center")
+        desc_cell.alignment  = Alignment(vertical="center")
+        ws.row_dimensions[i].height = 18
+
+    # ── Colour key ────────────────────────────────────────────────────────────
+    key_title = ws.cell(row=17, column=2, value="Row colour key")
+    key_title.font      = Font(bold=True, size=11, color=_BRAND_DARK)
+    key_title.alignment = Alignment(vertical="center")
+    ws.row_dimensions[17].height = 20
+
+    colour_key = [
+        (_SUCCESS_BG, _SUCCESS_FG, "success   — workflow run completed successfully"),
+        (_FAILURE_BG, _FAILURE_FG, "failure   — workflow run failed or timed out"),
+        (_WARN_BG,    _WARN_FG,    "cancelled — workflow run was cancelled or skipped"),
+        (_BRAND_LIGHT, _BRAND_DARK, "no status — commit / PR row with no associated run"),
+    ]
+    for i, (bg, fg, label) in enumerate(colour_key, start=18):
+        swatch = ws.cell(row=i, column=2, value="")
+        swatch.fill        = PatternFill("solid", fgColor=bg)
+        swatch.border      = _THIN
+        desc_cell          = ws.cell(row=i, column=3, value=label)
+        desc_cell.font     = Font(color=fg, size=10)
+        ws.row_dimensions[i].height = 18
+
+
 def save_excel(
     activity_rows: list[dict],
     access_rows:   list[dict],
@@ -986,19 +1145,15 @@ def save_excel(
     path:          str,
 ) -> None:
     """
-    Write all four sheets to an Excel workbook at *path*.
+    Write all sheets to an Excel workbook at *path*.
 
-    Sheets created:
-        Activity        — primary data (commits × PRs × workflow runs)
-        Access Control  — collaborators and teams
-        Failure Summary — failed runs with diagnostics
-        Failure Alerts  — banner + alert table
+    Sheet order:  Cover → Activity → Access Control → Failure Summary → Failure Alerts
     """
     log.info("Writing Excel report → %s", path)
 
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        # Seed empty sheets so openpyxl creates them in order
         for sheet_name, cols in [
+            ("Cover",          []),
             ("Activity",       ACTIVITY_COLUMNS),
             ("Access Control", ACCESS_COLUMNS),
             ("Failure Summary", FAILURE_COLUMNS),
@@ -1010,6 +1165,8 @@ def save_excel(
 
         wb = writer.book
 
+        _write_cover_sheet(wb["Cover"])
+
         _write_sheet(
             wb["Activity"], ACTIVITY_COLUMNS, activity_rows,
             conclusion_col="Workflow Conclusion",
@@ -1019,17 +1176,17 @@ def save_excel(
         _write_sheet(
             wb["Failure Summary"], FAILURE_COLUMNS, failure_rows,
             conclusion_col="Workflow Conclusion",
-            date_col="Workflow Run ID",   # run IDs are monotonically increasing → latest first
+            date_col="Run Started At",
         )
         _write_alerts_sheet(wb["Failure Alerts"], alert_rows)
 
-        # Tab colours
-        wb["Activity"].sheet_properties.tabColor        = "1F3864"   # navy
-        wb["Access Control"].sheet_properties.tabColor  = "375623"   # dark green
-        wb["Failure Summary"].sheet_properties.tabColor = "9C0006"   # dark red
-        wb["Failure Alerts"].sheet_properties.tabColor  = "FF0000"   # bright red
+        # ✏  CHANGE: tab colours to match your brand
+        wb["Cover"].sheet_properties.tabColor          = _BRAND_DARK
+        wb["Activity"].sheet_properties.tabColor       = "1F6B9E"   # steel blue
+        wb["Access Control"].sheet_properties.tabColor = "375623"   # dark green
+        wb["Failure Summary"].sheet_properties.tabColor = "9C0006"  # dark red
+        wb["Failure Alerts"].sheet_properties.tabColor  = "FF0000"  # bright red
 
-        # Open on Failure Alerts when there are failures
         wb.active = wb["Failure Alerts"] if alert_rows else wb["Activity"]
 
     log.info(
@@ -1037,18 +1194,18 @@ def save_excel(
         path, len(activity_rows), len(access_rows), len(failure_rows), len(alert_rows),
     )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    log.info("=== GitHub Activity Report ===")
+    log.info("=== %s ===", REPORT_TITLE)
     log.info("Output : %s", OUTPUT)
 
     if not GH_PAT:
         log.warning(
-            "GH_PAT / GITHUB_TOKEN not set — API access will be unauthenticated "
-            "(60 requests/hour limit applies)"
+            "GH_PAT / GITHUB_TOKEN not set — unauthenticated requests are "
+            "rate-limited to 60/hour.  Set GH_PAT for production use."
         )
 
     repos = fetch_repos()
@@ -1083,12 +1240,10 @@ def main() -> None:
         access = fetch_access_control(org, name)
         log.info("    %d user(s)/team(s)", len(access))
 
-        # Assemble rows
         all_activity.extend(build_activity_rows(meta, commits, prs, runs))
         all_access.extend(build_access_rows(org, name, access))
         all_failures.extend(build_failure_rows(org, name, runs))
 
-        # Build alert rows for the banner sheet
         base_idx = len(all_alerts) + 1
         for idx, run in enumerate(
             (r for r in runs if r["conclusion"] in ("failure", "timed_out", "startup_failure")),
@@ -1101,6 +1256,7 @@ def main() -> None:
                 "Workflow Name":  run["workflow"],
                 "Run ID":         run["run_id"],
                 "Trigger":        run["event"],
+                "Run Started At": run.get("run_started_at", ""),
                 "Conclusion":     run["conclusion"],
                 "Failure Reason": run.get("failure_reason", run["conclusion"]),
                 "Failed Job":     run.get("failed_job", ""),
@@ -1109,7 +1265,7 @@ def main() -> None:
                 "Suggested Fix":  run.get("suggested_fix", ""),
             })
 
-    # Summary
+    # Summary log
     log.info("=== Summary ===")
     log.info("  Repositories : %d", len(repos))
     log.info("  Activity rows: %d", len(all_activity))

@@ -1,451 +1,475 @@
 # GitHub Activity Report
 
-A Python script that collects commits, pull requests, and workflow runs from any GitHub repository using the GitHub REST API and exports a formatted, colour-coded Excel report.
-
-Runs locally in one command. Also ships a GitHub Actions workflow that generates and uploads the report automatically on every push or pull request.
+A production-grade Python tool that collects commits, pull requests, and GitHub
+Actions workflow runs across one repository or an entire organisation, joins
+the data on commit SHA, and writes a colour-coded multi-sheet Excel report that
+is committed back to the repository on every run.
 
 ---
 
 ## Table of Contents
 
-- [What it produces](#what-it-produces)
-- [Project structure](#project-structure)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Configuration — environment variables](#configuration--environment-variables)
-- [Create a GitHub Personal Access Token](#create-a-github-personal-access-token)
-- [Run locally](#run-locally)
-- [Expected output](#expected-output)
-- [Excel report format](#excel-report-format)
-- [How the data is assembled](#how-the-data-is-assembled)
-- [GitHub Actions — automated report](#github-actions--automated-report)
-- [Workflow triggers](#workflow-triggers)
-- [Download the artifact](#download-the-artifact)
-- [Troubleshooting](#troubleshooting)
+1. [What You Need to Provide](#what-you-need-to-provide)
+2. [What the Report Contains](#what-the-report-contains)
+3. [Prerequisites](#prerequisites)
+4. [Quick Start — Local](#quick-start--local)
+5. [Configuration Reference](#configuration-reference)
+6. [Token Permissions](#token-permissions)
+7. [GitHub Actions Setup](#github-actions-setup)
+8. [Organisation-Wide Scanning](#organisation-wide-scanning)
+9. [Excel Report Layout](#excel-report-layout)
+10. [Row Colour Guide](#row-colour-guide)
+11. [What to Change in the Code](#what-to-change-in-the-code)
+12. [Troubleshooting](#troubleshooting)
+13. [Project Structure](#project-structure)
 
 ---
 
-## What it produces
+## What You Need to Provide
 
-A single Excel file — `github_activity_report.xlsx` — with one sheet named **Activity**.
+This is the complete list of things **you must supply** before the tool works
+in your organisation. Everything else has a safe default.
 
-Every row represents a unit of repository activity. Commits, pull requests, and workflow runs are joined together on their shared commit SHA so the full picture of each change is visible in one place.
+### 1. GitHub Personal Access Token — `GH_PAT`
 
-| Column | Description |
+A Classic PAT with the following scopes:
+
+| Scope | Why it is needed |
 |---|---|
-| Repository | Repository name |
-| Organization | Owner / organization name |
-| Commit ID | Full 40-character SHA |
-| Commit Message | First line of the commit message |
-| Commit Author | GitHub login (falls back to git author name) |
-| Commit Date | ISO 8601 timestamp |
-| Branch | Branch the commit was first seen on |
-| PR ID | Pull request number |
-| PR Title | Pull request title |
-| PR Author | GitHub login of the PR author |
-| PR Status | `open`, `closed`, or `merged` |
-| PR Merge Date | ISO 8601 merge timestamp (empty if not merged) |
-| Workflow Name | Name of the GitHub Actions workflow |
-| Workflow Run ID | Numeric run ID |
-| Workflow Status | `completed`, `in_progress`, `queued`, etc. |
-| Workflow Conclusion/Error Reason | `success`, `failure`, `cancelled`, or detail of which job/step failed |
-| Trigger | Event that triggered the run: `push`, `pull_request`, `schedule`, etc. |
+| `repo` | Read commits, PRs, branches (including private repos) |
+| `workflow` | Read workflow run details and logs |
+| `read:org` | List all repositories in an organisation |
+
+**How to create it:**
+`GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic) → Generate new token`
+
+Add it as a **repository secret** named `GH_PAT`:
+`Your repo → Settings → Secrets and variables → Actions → New repository secret`
 
 ---
 
-## Project structure
+### 2. Target — at least one of these
 
-```
-git-report/
-├── github_activity_report.py       # Main script
-├── requirements.txt                # Python dependencies
-├── demo.txt                        # Test file (placeholder)
-└── .github/
-    └── workflows/
-        └── github_activity_report.yml   # GitHub Actions workflow
-```
+| Variable | What it does | Example value |
+|---|---|---|
+| `GH_REPO` | Scan a **single** repository | `my-org/backend-api` |
+| `GH_ORG` | Scan **all repos** in an organisation | `my-org` |
+
+> If both are set, `GH_REPO` takes priority.
+> If neither is set, the tool scans all repos the token can reach.
+
+**Where to set for GitHub Actions:** edit
+[.github/workflows/github_activity_report.yml](.github/workflows/github_activity_report.yml)
+and add your values to the `env:` block of the *Run GitHub Activity Report* step.
+
+---
+
+### 3. Report title and contact details (optional but recommended)
+
+Search for `✏ CHANGE` in
+[github_activity_report.py](github_activity_report.py) — there are five
+clearly marked places:
+
+| Mark in code | What to set |
+|---|---|
+| `GH_ORG` default | Your GitHub organisation login |
+| `REPORT_TITLE` default | Your organisation or project name |
+| `"Maintained by"` in cover sheet | Your team name |
+| `"Contact"` in cover sheet | Your team email / Slack channel |
+| `_BRAND_DARK` hex colour | Your brand primary colour (optional) |
+
+---
+
+## What the Report Contains
+
+| Sheet | Contents |
+|---|---|
+| **Cover** | Title, generation timestamp, date range, colour key, contact details |
+| **Activity** | Every commit × PR × workflow run joined on commit SHA — latest first |
+| **Access Control** | Collaborators and teams with permission levels |
+| **Failure Summary** | All failed / timed-out runs with root-cause diagnostics |
+| **Failure Alerts** | Red banner + summary table for every failure found |
 
 ---
 
 ## Prerequisites
 
-| Requirement | Minimum version | Check command |
-|---|---|---|
-| Python | 3.10 | `python3 --version` |
-| pip | Any recent | `pip --version` |
-| GitHub Personal Access Token | — | See [Create a PAT](#create-a-github-personal-access-token) |
+- Python **3.10** or later
+- A GitHub Personal Access Token (see above)
+
+```bash
+python3 --version   # must be 3.10+
+```
 
 ---
 
-## Installation
-
-### 1. Clone or download the project
+## Quick Start — Local
 
 ```bash
-git clone https://github.com/<your-org>/<your-repo>.git
-cd git-report/git-report
-```
+# 1. Clone the repository
+git clone https://github.com/<your-org>/git-report.git
+cd git-report
 
-### 2. Install Python dependencies
+# 2. Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-```bash
+# 3. Install dependencies
 pip install -r requirements.txt
+
+# 4. Set required environment variables
+export GH_PAT=ghp_xxxxxxxxxxxxxxxxxxxx   # your Personal Access Token
+export GH_REPO=my-org/my-repo            # OR use GH_ORG for org-wide scan
+
+# 5. Run
+python github_activity_report.py
+
+# Output: github_activity_report.xlsx
 ```
 
-This installs:
+---
 
-| Package | Version | Purpose |
+## Configuration Reference
+
+All configuration is passed through environment variables — no files to edit
+for basic use.
+
+### Required
+
+| Variable | Description | Example |
 |---|---|---|
-| `requests` | >= 2.31.0 | GitHub REST API calls with pagination and rate-limit handling |
-| `pandas` | >= 2.0.0 | DataFrame assembly and Excel writing |
-| `openpyxl` | >= 3.1.0 | Excel formatting — colours, column widths, freeze panes, auto-filter |
+| `GH_PAT` | Personal Access Token | `ghp_abc123...` |
+| `GH_REPO` | Single repo to scan (`owner/repo`) | `my-org/backend-api` |
+| `GH_ORG` | Organisation login (scans all repos) | `my-org` |
 
----
+### Optional
 
-## Configuration — environment variables
+| Variable | Default | Description |
+|---|---|---|
+| `GH_OUTPUT` | `github_activity_report.xlsx` | Output file path |
+| `GH_MAX_RUNS` | `200` | Max workflow runs fetched per repo |
+| `GH_LOOKBACK_DAYS` | `30` | Report activity from the last N days |
+| `GH_SINCE` | *(none)* | ISO-8601 start date — overrides `GH_LOOKBACK_DAYS` |
+| `GH_UNTIL` | *(none)* | ISO-8601 end date |
+| `GH_LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING` |
+| `GH_REPORT_TITLE` | `GitHub Activity & Workflow Audit Report` | Banner title in the Excel file |
 
-All configuration is passed through environment variables. No config files need editing.
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `GH_PAT` | **Yes** | — | GitHub Personal Access Token for API authentication |
-| `GH_REPO` | **Yes** (local) | Auto-set in Actions | Repository in `owner/repo` format — e.g. `octocat/Hello-World` |
-| `GH_OUTPUT` | No | `github_activity_report.xlsx` | Output file path |
-| `GH_MAX_RUNS` | No | `200` | Maximum number of workflow runs to fetch |
-
-> In GitHub Actions, `GH_REPO` is set automatically from `${{ github.repository }}` — you do not need to set it manually.
-
----
-
-## Create a GitHub Personal Access Token
-
-The script needs read access to the target repository's contents, pull requests, and Actions.
-
-### Fine-grained token (recommended)
-
-1. Go to **GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens**
-2. Click **Generate new token**
-3. Set **Resource owner** to the org or user that owns the repository
-4. Under **Repository access** select the specific repository
-5. Under **Permissions → Repository permissions** enable:
-
-   | Permission | Access level |
-   |---|---|
-   | Contents | Read-only |
-   | Pull requests | Read-only |
-   | Actions | Read-only |
-   | Metadata | Read-only (auto-selected) |
-
-6. Click **Generate token** and copy the value immediately — it is only shown once
-
-### Classic token (alternative)
-
-1. Go to **GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)**
-2. Click **Generate new token (classic)**
-3. Select scopes: `repo` (full) and `workflow`
-4. Click **Generate token** and copy it
-
----
-
-## Run locally
-
-### Step 1 — Set environment variables
+### Date filtering examples
 
 ```bash
-export GH_PAT=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-export GH_REPO=owner/repo-name
-```
+# Last 7 days
+export GH_LOOKBACK_DAYS=7
 
-The format for `GH_REPO` must contain a `/` separating owner and repository name:
+# Specific quarter
+export GH_SINCE=2024-01-01
+export GH_UNTIL=2024-03-31
 
-```bash
-# Correct
-export GH_REPO=octocat/Hello-World
-export GH_REPO=my-org/my-repo
-
-# Wrong — will exit with an error
-export GH_REPO=my-repo-name
-```
-
-### Step 2 — Run the script
-
-```bash
-python3 github_activity_report.py
-```
-
-### Step 3 — Optional overrides
-
-```bash
-# Save to a different file path
-export GH_OUTPUT=/tmp/my_report.xlsx
-
-# Fetch up to 500 workflow runs instead of the default 200
-export GH_MAX_RUNS=500
-
-python3 github_activity_report.py
+# Debug mode
+export GH_LOG_LEVEL=DEBUG
 ```
 
 ---
 
-## Expected output
+## Token Permissions
 
-The script prints timestamped progress logs as it runs:
+### Classic PAT — recommended for org-wide use
 
-```
-09:14:01  INFO     === GitHub Activity Report ===
-09:14:01  INFO     Repository : octocat/Hello-World
-09:14:01  INFO     Output     : github_activity_report.xlsx
-09:14:01  INFO     Fetching branches …
-09:14:02  INFO       3 branch(es) found
-09:14:02  INFO     Fetching commits for 3 branch(es) …
-09:14:02  INFO       branch: main
-09:14:03  INFO       branch: develop
-09:14:04  INFO       branch: feature/new-ui
-09:14:05  INFO       47 unique commit(s) found
-09:14:05  INFO     Fetching pull requests …
-09:14:06  INFO       12 pull request(s) found
-09:14:06  INFO     Fetching workflow runs (max 200) …
-09:14:07  INFO       38 workflow run(s) found
-09:14:07  INFO       fetching job detail for failed run 9871234 …
-09:14:08  INFO       fetching job detail for failed run 9865432 …
-09:14:08  INFO     Assembling dataset …
-09:14:08  INFO     Total rows : 61
-09:14:08  INFO     Report saved → github_activity_report.xlsx  (61 data rows)
-
-Done. Report written to: github_activity_report.xlsx
-```
-
-The output file is created in the current working directory unless `GH_OUTPUT` overrides the path.
-
----
-
-## Excel report format
-
-The generated `github_activity_report.xlsx` file has the following formatting applied automatically:
-
-| Element | Format |
+| Scope | Reason |
 |---|---|
-| Sheet name | `Activity` |
-| Header row | Dark navy background (`#1F3864`), white bold text, centred |
-| Alternate rows | Light blue background (`#DCE6F1`) for readability |
-| Failed workflow rows | Light red background (`#FFCCCC`) — rows where Workflow Status is `failure` or `timed_out` |
-| Column widths | Auto-sized to content, capped at 60 characters |
-| Freeze panes | Row 1 (header) is frozen so it stays visible when scrolling |
-| Auto-filter | Enabled on all columns — click any header to sort or filter |
+| `repo` | Read commits, PRs, branches (private repos) |
+| `workflow` | Read workflow runs and logs |
+| `read:org` | List organisation repositories |
 
-### Failure detail
+Create at:
+`GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)`
 
-For workflow runs with conclusion `failure` or `timed_out`, the script fetches the job and step level detail and populates **Workflow Conclusion/Error Reason** with the specific location:
+### Fine-grained PAT — for stricter environments
 
-```
-Failed at: build / Run tests
-Timed out at: deploy / Wait for deployment
-```
-
-For other conclusions:
-
-| Conclusion | Error Reason value |
+| Permission | Level |
 |---|---|
-| `success` | _(empty)_ |
-| `failure` | `Failed at: <job> / <step>` |
-| `timed_out` | `Timed out at: <job> / <step>` |
-| `startup_failure` | `Workflow startup failure` |
-| `cancelled` | `Cancelled` |
+| Contents | Read |
+| Actions | Read |
+| Pull requests | Read |
+| Members *(org-level)* | Read |
+
+### Built-in `GITHUB_TOKEN` — single repo only
+
+Works automatically inside GitHub Actions for the current repository only.
+Cannot read workflow logs or access other repositories.
+Used as a fallback when `GH_PAT` is not set.
 
 ---
 
-## How the data is assembled
+## GitHub Actions Setup
 
-The script fetches four data sources and joins them by commit SHA:
+The workflow runs automatically on every push to `main`, on pull requests,
+on manual trigger, and after any other workflow completes.  It generates the
+report, uploads it as an artifact, and commits the file back to the repository.
+
+### Step 1 — Add the PAT secret
 
 ```
-fetch_branches()
-    └── fetch_commits()   ← one call per branch, de-duplicated by SHA
-                                │
-                                ├── joined to PRs via merge_sha or head_sha
-                                └── joined to workflow runs via head_sha
+Your repo → Settings → Secrets and variables → Actions → New repository secret
 
-fetch_pull_requests()     ← all states: open, closed, merged
-fetch_workflow_runs()     ← up to GH_MAX_RUNS, newest first
+Name:  GH_PAT
+Value: <your Personal Access Token>
 ```
 
-**Row generation rules:**
+### Step 2 — Set your organisation or repository
 
-1. Each commit is an anchor row
-2. If a commit matches multiple workflow runs → one row per run
-3. If a commit matches a PR → PR columns are filled on the same row
-4. PRs with no matching commit → their own row (commit columns empty)
-5. Workflow runs with no matching commit → their own row (commit columns contain the head SHA)
-
-**Pagination:** all API calls follow GitHub's `Link: next` header automatically. Repositories with thousands of commits or hundreds of workflow runs are handled correctly.
-
-**Rate limiting:** if the API returns a 429 or 403 rate-limit response, the script reads the `X-RateLimit-Reset` header and sleeps until the window resets before retrying — up to 5 retries per page.
-
----
-
-## GitHub Actions — automated report
-
-The workflow file at [.github/workflows/github_activity_report.yml](.github/workflows/github_activity_report.yml) runs the script automatically and uploads the Excel file as a downloadable artifact.
-
-### Setup — add the PAT as a repository secret
-
-1. Go to your repository on GitHub
-2. Click **Settings → Secrets and variables → Actions → New repository secret**
-3. Name: `GH_PAT`
-4. Value: your Personal Access Token (from [Create a PAT](#create-a-github-personal-access-token))
-5. Click **Add secret**
-
-The workflow reads `GH_REPO` from `${{ github.repository }}` automatically — no additional secrets needed.
-
-### Workflow file overview
+Edit [.github/workflows/github_activity_report.yml](.github/workflows/github_activity_report.yml),
+find the `Run GitHub Activity Report` step, and add your values:
 
 ```yaml
-name: GitHub Activity Report
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:        # manual trigger from the Actions UI
-
-jobs:
-  report:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - uses: actions/cache@v4          # caches pip downloads
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-      - run: pip install -r requirements.txt
-      - run: python github_activity_report.py
-        env:
-          GH_PAT:  ${{ secrets.GH_PAT }}
-          GH_REPO: ${{ github.repository }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: github_activity_report
-          path: github_activity_report.xlsx
-          if-no-files-found: error
+- name: Run GitHub Activity Report
+  env:
+    GH_PAT: ${{ secrets.GH_PAT || github.token }}
+    GH_REPO: ${{ github.repository }}   # ← scans this repo only
+    # GH_ORG: my-org-name               # ← uncomment to scan all org repos
+    GH_LOOKBACK_DAYS: "30"
+    GH_REPORT_TITLE: "My Org — GitHub Activity Report"
 ```
 
+### Step 3 — Push and verify
+
+Push any change to `main`. The workflow will:
+1. Run the Python script
+2. Upload `github_activity_report.xlsx` as a downloadable **Actions artifact**
+3. Commit it back to the repository (`chore: update activity report [...]`)
+
+### Downloading the artifact
+
+`GitHub → Actions → GitHub Activity Report → latest run → Artifacts → github_activity_report`
+
 ---
 
-## Workflow triggers
+## Organisation-Wide Scanning
 
-| Trigger | When it runs |
+To scan every repository in your GitHub organisation:
+
+```bash
+export GH_PAT=ghp_xxxxxxxxxxxxxxxxxxxx
+export GH_ORG=my-org-name
+# Do NOT set GH_REPO
+python github_activity_report.py
+```
+
+In GitHub Actions, remove `GH_REPO` from the env block and add `GH_ORG`:
+
+```yaml
+env:
+  GH_PAT: ${{ secrets.GH_PAT }}
+  GH_ORG: my-org-name
+  GH_LOOKBACK_DAYS: "30"
+```
+
+> **Rate limits:** org-wide scans make thousands of API calls. Use a PAT
+> (5 000 req/hr) rather than the built-in token (1 000 req/hr). The script
+> waits automatically when rate-limited and resumes.
+
+---
+
+## Excel Report Layout
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  COVER          — title, config, date range, colour key  │  ← opens first
+├──────────────────────────────────────────────────────────┤
+│  ACTIVITY       — commits × PRs × runs (latest at top)   │
+├──────────────────────────────────────────────────────────┤
+│  ACCESS CONTROL — collaborators and teams                 │
+├──────────────────────────────────────────────────────────┤
+│  FAILURE SUMMARY — failed runs with diagnostics           │
+├──────────────────────────────────────────────────────────┤
+│  FAILURE ALERTS  — banner + alert table                   │  ← opens first if failures
+└──────────────────────────────────────────────────────────┘
+```
+
+All data sheets have:
+- **Latest rows at the top** — sorted by commit date / run start time
+- **Frozen header row** — stays visible when scrolling
+- **Auto-filter dropdowns** on every column
+- **Auto-sized columns** (capped at 62 characters)
+
+### Activity sheet columns
+
+| Column | Description |
 |---|---|
-| `push` to `main` | Every time a commit is pushed to the `main` branch |
-| `pull_request` to `main` | Every time a PR is opened, updated, or synchronized against `main` |
-| `workflow_dispatch` | Manually from **Actions → GitHub Activity Report → Run workflow** |
+| Repository | Repository name |
+| Organization | Owner / organisation |
+| Visibility | `public` or `private` |
+| Default Branch | e.g. `main` |
+| Commit ID | Full 40-character SHA |
+| Commit Message | First line of the commit message |
+| Author | GitHub login (falls back to git author name) |
+| Date | ISO 8601 commit timestamp |
+| Branch | Branch the commit was first seen on |
+| PR ID | Pull request number |
+| PR Title | Pull request title |
+| PR Author | GitHub login of the PR author |
+| PR Status | `open`, `closed`, or `merged` |
+| PR Merged | `Yes` / `No` |
+| PR Merge Date | ISO 8601 merge timestamp |
+| Workflow Name | GitHub Actions workflow name |
+| Workflow Run ID | Numeric run ID |
+| Trigger Event | `push`, `pull_request`, `schedule`, `workflow_dispatch`, etc. |
+| Run Started At | ISO 8601 run start timestamp |
+| Workflow Status | `completed`, `in_progress`, `queued` |
+| Workflow Conclusion | `success`, `failure`, `cancelled`, `timed_out` |
+| Failure Reason | Human-readable failure description |
+| Failed Job | Name of the job that failed |
+| Failed Step | Name of the step that failed |
+| Error Line | Line number from the log (if found) |
+| Suggested Fix | Automated fix recommendation |
 
 ---
 
-## Download the artifact
+## Row Colour Guide
 
-1. Go to your repository on GitHub
-2. Click **Actions** in the top navigation
-3. Click the **GitHub Activity Report** workflow
-4. Click the most recent successful run
-5. Scroll to the bottom of the run summary page
-6. Under **Artifacts**, click **github_activity_report** to download a `.zip`
-7. Unzip and open `github_activity_report.xlsx`
+| Colour | Applies when | Meaning |
+|---|---|---|
+| 🟢 **Green** (all columns) | `Workflow Conclusion = success` | Run completed successfully |
+| 🔴 **Red** (all columns) | `Workflow Conclusion = failure / timed_out` | Run failed or timed out |
+| 🟡 **Yellow** (all columns) | `Workflow Conclusion = cancelled / skipped` | Run was cancelled or skipped |
+| ⬜ White / grey stripe | No workflow conclusion | Commit or PR with no associated run |
+
+Every cell in a row gets the same colour — not just the status column — so
+failures are immediately visible when scanning the sheet.
+
+---
+
+## What to Change in the Code
+
+Open [github_activity_report.py](github_activity_report.py) and search for
+`✏ CHANGE` — every customisation point is marked.
+
+### Section 1 — Organisation / project configuration (top of file)
+
+```python
+GH_ORG   = os.getenv("GH_ORG", "")          # ✏ CHANGE: your org login
+MAX_RUNS = int(os.getenv("GH_MAX_RUNS", "200"))  # ✏ CHANGE: increase for busier orgs
+LOOKBACK_DAYS = int(os.getenv("GH_LOOKBACK_DAYS", "30"))  # ✏ CHANGE: history window
+REPORT_TITLE = os.getenv("GH_REPORT_TITLE", "GitHub Activity & Workflow Audit Report")
+```
+
+### Section 2 — Excel colour theme
+
+```python
+_BRAND_DARK  = "1F3864"   # ✏ CHANGE: header background — use your brand colour
+_BRAND_LIGHT = "EEF2F7"   # ✏ CHANGE: alternate row stripe
+_SUCCESS_BG  = "C6EFCE"   # ✏ CHANGE: success row background
+_FAILURE_BG  = "FFC7CE"   # ✏ CHANGE: failure row background
+```
+
+### Section 3 — Failure fix-hint rules
+
+Add entries to `_FIX_RULES` that match your stack:
+
+```python
+_FIX_RULES = [
+    # ✏ CHANGE: add keywords specific to your build tools
+    (["your-tool", "your-error-keyword"], "Your suggested fix message."),
+    ...
+]
+```
+
+### Section 4 — Column definitions
+
+Add or remove columns from any of the four column lists:
+
+```python
+ACTIVITY_COLUMNS = [
+    "Repository", "Organization", ...   # ✏ CHANGE: add/remove columns here
+]
+```
+
+### Cover sheet — contact details
+
+```python
+("Maintained by", "DevOps / Platform Engineering team"),   # ✏ CHANGE
+("Contact",        "devops@yourcompany.com"),               # ✏ CHANGE
+```
+
+### fetch_repos() — repository type filter
+
+```python
+params={"type": "all"},   # ✏ CHANGE: use "public" to skip private repos
+```
+
+### GitHub Enterprise Server
+
+Replace `BASE_URL` at the top of the file:
+
+```python
+BASE_URL = "https://api.github.com"
+# ✏ CHANGE for GHES:
+# BASE_URL = "https://github.mycompany.com/api/v3"
+```
 
 ---
 
 ## Troubleshooting
 
-### `GH_REPO must be in 'owner/repo' format`
+### "No repositories found"
+- Check `GH_ORG` is the correct organisation login (case-sensitive)
+- Verify the PAT has `read:org` scope
+- If your org uses SAML SSO, the token must be authorised for SSO
 
-```
-ERROR: GH_REPO must be in 'owner/repo' format.
-  Current value: 'my-repo-name'
-  Example:  export GH_REPO=vidyakar/whitedev
-```
+### "Repository not found or token lacks access"
+- Check `GH_REPO` is in `owner/repo` format — e.g. `my-org/backend-api`
+- Verify the PAT has `repo` scope for private repos
 
-The value must include the owner separated by `/`. Find the correct format in the repository URL:  
-`https://github.com/<owner>/<repo>` → `export GH_REPO=<owner>/<repo>`
+### "Rate-limited — sleeping N s"
+- Normal behaviour — the script waits automatically and resumes
+- Use a PAT instead of the built-in token for higher limits (5 000 vs 1 000 req/hr)
 
----
+### Report committed back but shows no change
+- The workflow skips the commit when the Excel file is identical to the previous
+  run — this means no new activity occurred in the lookback window
 
-### `401 Unauthorized`
+### Access Control sheet is empty
+- Requires `repo` scope on a Classic PAT
+- Teams endpoint returns 404 for personal repositories — expected behaviour
 
-The PAT is invalid, expired, or was not set:
+### Excel file opens on "Failure Alerts" tab
+- Intentional — the file opens on the most important sheet when failures exist
 
+### Enable debug logging
 ```bash
-# Check the variable is actually set
-echo $GH_PAT
-```
-
-If it is empty, re-export it. If it is set but returns 401, regenerate the token on GitHub.
-
----
-
-### `403 Forbidden` on Actions endpoints
-
-The PAT is missing the `Actions: Read` permission. Regenerate the token and add **Actions → Read-only** to the permissions.
-
----
-
-### `404 Not Found`
-
-```
-ERROR  404 Not Found: https://api.github.com/repos/owner/repo/branches
-```
-
-Either the repository name is wrong, or the repository is private and the PAT does not have access to it. Verify the exact `owner/repo` from the repository URL on GitHub.
-
----
-
-### Rate limit warning during run
-
-```
-WARNING  Rate-limited. Sleeping 42s …
-```
-
-This is normal behaviour for large repositories or unauthenticated requests. The script waits automatically and resumes. To avoid this, ensure `GH_PAT` is set — authenticated requests have a limit of 5,000 per hour vs 60 per hour unauthenticated.
-
----
-
-### `ModuleNotFoundError: No module named 'openpyxl'`
-
-Dependencies are not installed:
-
-```bash
-pip install -r requirements.txt
+export GH_LOG_LEVEL=DEBUG
+python github_activity_report.py
 ```
 
 ---
 
-### Workflow runs in Actions but report is empty (0 data rows)
-
-The target repository exists but has no commits, PRs, or workflow runs yet. Run the script against a repository with actual activity.
-
----
-
-### `if-no-files-found: error` failure in Actions
-
-The script exited before writing the Excel file — check the step logs immediately before the upload step for the actual Python error.
-
----
-
-### Pylance shows `Import could not be resolved` for openpyxl
-
-This is a VS Code IDE warning, not a runtime error. It means openpyxl is not installed in the Python interpreter VS Code is using. Fix by selecting the correct interpreter:
+## Project Structure
 
 ```
-Cmd/Ctrl + Shift + P → Python: Select Interpreter → pick the env where you ran pip install
+.
+├── github_activity_report.py           # Main script
+├── requirements.txt                    # Python dependencies (requests, pandas, openpyxl)
+├── README.md                           # This file
+└── .github/
+    └── workflows/
+        └── github_activity_report.yml  # GitHub Actions workflow
 ```
 
-Or install into the active interpreter:
+### Customisation map inside the script
 
-```bash
-pip install openpyxl
+```
+github_activity_report.py
+│
+├── SECTION 1  ✏  Organisation / project configuration
+│               GH_ORG, REPORT_TITLE, MAX_RUNS, LOOKBACK_DAYS
+│
+├── SECTION 2  ✏  Excel colour theme
+│               Hex codes for headers, success, failure, warning rows
+│
+├── SECTION 3  ✏  Failure fix-hint rules
+│               Keyword → suggestion mappings for your tech stack
+│
+├── SECTION 4  ✏  Column definitions
+│               Add / remove / rename columns in any sheet
+│
+└── _write_cover_sheet()  ✏  Team name and contact email on the Cover sheet
 ```
