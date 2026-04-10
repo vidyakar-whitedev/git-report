@@ -48,6 +48,7 @@ jobs:
         env:
           GH_PAT: ${{ secrets.GH_PAT || github.token }}
           GH_REPO: ${{ github.repository }}
+          GH_LOOKBACK_DAYS: "30"   # only report on runs from the last 30 days
         run: python github_activity_report.py
 
       - name: Upload Excel report as artifact

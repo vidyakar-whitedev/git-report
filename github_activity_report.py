@@ -39,11 +39,12 @@ from openpyxl.utils import get_column_letter
 # Configuration
 # ---------------------------------------------------------------------------
 
-GH_PAT    = os.getenv("GH_PAT") or os.getenv("GITHUB_TOKEN", "")
-GH_REPO   = os.getenv("GH_REPO") or os.getenv("GITHUB_REPOSITORY", "")
-OUTPUT    = os.getenv("GH_OUTPUT", "github_activity_audit_report.xlsx")
-MAX_RUNS  = int(os.getenv("GH_MAX_RUNS", "200"))
-BASE_URL  = "https://api.github.com"
+GH_PAT          = os.getenv("GH_PAT") or os.getenv("GITHUB_TOKEN", "")
+GH_REPO         = os.getenv("GH_REPO") or os.getenv("GITHUB_REPOSITORY", "")
+OUTPUT          = os.getenv("GH_OUTPUT", "github_activity_audit_report.xlsx")
+MAX_RUNS        = int(os.getenv("GH_MAX_RUNS", "200"))
+LOOKBACK_DAYS   = int(os.getenv("GH_LOOKBACK_DAYS", "30"))
+BASE_URL        = "https://api.github.com"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -370,12 +371,21 @@ def _fetch_failure_detail(org: str, repo_name: str, run_id: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def fetch_workflow_runs(org: str, repo_name: str) -> list[dict]:
-    log.info("    Fetching workflow runs (max %d) …", MAX_RUNS)
+    from datetime import datetime, timezone, timedelta
+    since_dt = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+    log.info("    Fetching workflow runs (max %d, last %d days) …", MAX_RUNS, LOOKBACK_DAYS)
     raw_runs = _paginate(
         f"{BASE_URL}/repos/{org}/{repo_name}/actions/runs",
         max_items=MAX_RUNS,
     )
-    log.info("      %d run(s) found", len(raw_runs))
+    # Filter to runs within the lookback window
+    raw_runs = [
+        r for r in raw_runs
+        if datetime.fromisoformat(
+            (r.get("created_at") or r.get("run_started_at") or "1970-01-01T00:00:00Z").rstrip("Z") + "+00:00"
+        ) >= since_dt
+    ]
+    log.info("      %d run(s) found within last %d days", len(raw_runs), LOOKBACK_DAYS)
 
     result = []
     for run in raw_runs:
