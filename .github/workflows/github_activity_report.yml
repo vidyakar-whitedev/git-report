@@ -7,7 +7,7 @@ on:
   pull_request:
     branches:
       - main
-  workflow_dispatch:   # allow manual runs from the Actions UI
+  workflow_dispatch:        # allow manual runs from the Actions UI
   workflow_run:
     workflows: ["*"]
     types:
@@ -18,13 +18,15 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read
-      actions: read
+      contents: write        # needed to commit the Excel report back to the repo
+      actions: read          # needed to read workflow run details
       pull-requests: read
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # full history so git push works correctly
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -48,12 +50,34 @@ jobs:
         env:
           GH_PAT: ${{ secrets.GH_PAT || github.token }}
           GH_REPO: ${{ github.repository }}
-          GH_LOOKBACK_DAYS: "30"   # only report on runs from the last 30 days
+          GH_LOOKBACK_DAYS: "30"
         run: python github_activity_report.py
 
       - name: Upload Excel report as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: github_activity_audit_report
-          path: github_activity_audit_report.xlsx
+          name: github_activity_report
+          path: github_activity_report.xlsx
           if-no-files-found: error
+
+      - name: Commit and push report to repository
+        # Skip on pull_request events — PRs run in a fork context and cannot
+        # push to the base branch. Only commit on push / workflow_dispatch /
+        # workflow_run triggers.
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage only the report file
+          git add github_activity_report.xlsx
+
+          # If nothing changed (report is identical to last run) skip the commit
+          if git diff --staged --quiet; then
+            echo "Report unchanged — nothing to commit."
+          else
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+            git commit -m "chore: update activity report [${TIMESTAMP}] via ${{ github.event_name }} (run ${{ github.run_id }})"
+
+            git push
+          fi
