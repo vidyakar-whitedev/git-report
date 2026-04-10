@@ -1,1 +1,2 @@
 This file is used for test purpose.
+test case
