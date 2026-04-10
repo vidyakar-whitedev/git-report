@@ -8,13 +8,19 @@ on:
     branches:
       - main
   workflow_dispatch:   # allow manual runs from the Actions UI
+  workflow_run:
+    workflows: ["*"]
+    types:
+      - completed
 
 jobs:
-  report:
+  generate_report:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read   # needed to read repo data via GH_PAT
+      contents: read
+      actions: read
+      pull-requests: read
 
     steps:
       - name: Checkout repository
@@ -40,13 +46,13 @@ jobs:
 
       - name: Run GitHub Activity Report
         env:
-          GH_PAT:  ${{ secrets.GH_PAT }}
+          GH_PAT: ${{ secrets.GH_PAT || github.token }}
           GH_REPO: ${{ github.repository }}
         run: python github_activity_report.py
 
       - name: Upload Excel report as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: github_activity_report
-          path: github_activity_report.xlsx
+          name: github_activity_audit_report
+          path: github_activity_audit_report.xlsx
           if-no-files-found: error

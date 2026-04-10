@@ -39,7 +39,7 @@ from openpyxl.utils import get_column_letter
 # Configuration
 # ---------------------------------------------------------------------------
 
-GH_PAT    = os.getenv("GH_PAT", "")
+GH_PAT    = os.getenv("GH_PAT") or os.getenv("GITHUB_TOKEN", "")
 GH_REPO   = os.getenv("GH_REPO") or os.getenv("GITHUB_REPOSITORY", "")
 OUTPUT    = os.getenv("GH_OUTPUT", "github_activity_audit_report.xlsx")
 MAX_RUNS  = int(os.getenv("GH_MAX_RUNS", "200"))
