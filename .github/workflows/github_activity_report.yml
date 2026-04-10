@@ -8,10 +8,11 @@ on:
     branches:
       - main
   workflow_dispatch:        # allow manual runs from the Actions UI
-  workflow_run:
-    workflows: ["*"]
-    types:
-      - completed
+  # NOTE: workflow_run: ["*"] was removed intentionally.
+  # It caused a self-triggering cascade: this workflow completes → fires itself
+  # again → two runs overlap → non-fast-forward push rejection.
+  # Use workflow_dispatch or a scheduled trigger if you need to run after
+  # other workflows complete.
 
 jobs:
   generate_report:
@@ -26,7 +27,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0     # full history so git push works correctly
+          fetch-depth: 0          # full history required for rebase during push
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -61,23 +62,27 @@ jobs:
           if-no-files-found: error
 
       - name: Commit and push report to repository
-        # Skip on pull_request events — PRs run in a fork context and cannot
-        # push to the base branch. Only commit on push / workflow_dispatch /
-        # workflow_run triggers.
+        # Skip on pull_request — PRs from forks cannot push to the base branch.
         if: github.event_name != 'pull_request'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Stage only the report file
           git add github_activity_report.xlsx
 
-          # If nothing changed (report is identical to last run) skip the commit
           if git diff --staged --quiet; then
             echo "Report unchanged — nothing to commit."
-          else
-            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
-            git commit -m "chore: update activity report [${TIMESTAMP}] via ${{ github.event_name }} (run ${{ github.run_id }})"
-
-            git push
+            exit 0
           fi
+
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+          git commit -m "chore: update activity report [${TIMESTAMP}] (run ${{ github.run_id }})"
+
+          # Pull remote changes with rebase before pushing to handle any
+          # commits that landed on the branch while this job was running.
+          # --no-edit avoids interactive prompts; --strategy-option=ours
+          # ensures our generated report always wins on conflict.
+          BRANCH="${{ github.ref_name }}"
+          git pull --rebase --strategy-option=ours origin "${BRANCH}"
+
+          git push origin "${BRANCH}"

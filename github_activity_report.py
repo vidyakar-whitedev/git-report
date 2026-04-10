@@ -979,14 +979,20 @@ def _write_sheet(
 
 def _write_alerts_sheet(ws, alert_rows: list[dict]) -> None:
     """
-    Write the Failure Alerts sheet.
+    Write the Failure Alerts sheet — latest failures at the top.
 
     Layout:
         Row 1  — merged banner: "⚠  N FAILURE(S)" or "✔  NO FAILURES"
         Row 2  — generated timestamp (right-aligned)
         Row 3  — column headers
-        Row 4+ — one alert per row, all red
+        Row 4+ — one alert per row, sorted latest-first, all red
     """
+    # Sort latest run first so the most recent failure is always at the top
+    alert_rows = _sort_rows(alert_rows, "Run Started At")
+    # Re-number the # column after sort
+    for i, row in enumerate(alert_rows, start=1):
+        row["#"] = i
+
     n_cols = len(ALERTS_COLUMNS)
     total  = len(alert_rows)
 
